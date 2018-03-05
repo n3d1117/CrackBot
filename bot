@@ -1,0 +1,236 @@
+#!/usr/local/bin/bash
+
+# COLORS
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly CYAN='\033[1;36m'
+readonly BLUE='\033[1;34m'
+readonly NC='\033[0m'
+
+# GLOBAL CONFIGURATION
+readonly BASEURL="http://your.base.url"
+readonly CRACKERNAME="h4x"
+readonly FTP_HOST="your.ftp.host"
+readonly FTP_USERNAME="YOUR_FTP_USERNAME"
+readonly FTP_PASSWORD="YOUR_FTP_PASSWORD"
+readonly FTP_DIR="/public_html/your/dir/"
+readonly DEVICE_DIR="/var/root/Documents/Cracked/"
+readonly CRACK_DIR="./cracked/"
+readonly USER_AGENT="user_agent"
+readonly DEVICE_IP="YOUR_DEVICE_IP"
+
+# TIMESTAMP
+timestamp() {
+	date +"%H:%M:%S"
+}
+
+# LOG WITH STYLE
+log_red () { echo -e "${RED}[$(timestamp)] $1${NC}"; }
+log_green () { echo -e "${GREEN}[$(timestamp)] ✔ $1${NC}"; }
+log_yellow () { echo -e "${YELLOW}[$(timestamp)] $1${NC}"; }
+log_cyan () { echo -e "${CYAN}[$(timestamp)] $1${NC}"; }
+log_blue () { echo -e "${BLUE}[$(timestamp)] $1${NC}"; }
+
+# HELP MENU
+function helptext {
+	scr=$(basename $0)
+	log_blue "USAGE: $scr <iTunes link>"
+}
+
+# If no arguments provided, invoke help text
+[[ $@ ]] || { helptext; exit 0; }
+
+# Reset BASH time counter
+SECONDS=0
+
+# If the argument has no 'itunes.apple.com', just quit
+if [[ ! "$1" == *'itunes.apple.com'* ]]; then
+	log_red "ERROR: Please input a correct iTunes URL."
+	exit 1
+fi
+
+# Do some url cleanup
+orig=$1
+itunes_url="${orig/\/ca\//\/us/}" # ca -> us store
+itunes_url="${itunes_url/?mt=8/}" # Strip ending '?mt=8'
+
+log_yellow "Script started correctly."
+
+# clean iTunes folder before starting.. sigh this is bad, i know
+rm -rf "$HOME"/Music/iTunes/iTunes\ Media/Mobile\ Applications/*.ipa
+
+sleep 1
+
+# Download ipa from itunes
+if ! ./ipa_from_itunes.js "$itunes_url"; then
+	log_red "ERROR: Failed to download ipa from iTunes."
+	exit 1
+fi
+
+# Check if tmp.txt exists
+if [ ! -e "./tmp.txt" ]; then
+	log_red "ERROR: ./tmp.txt file not found."
+	exit 1
+fi
+
+# WARNING: UGLY!!!
+# Get filename written in tmp.txt
+iconv -s -f MAC -t UTF-8 ./tmp.txt > ./tmp_.txt # hack to keep special characters
+enc_filename="$(cat ./tmp_.txt)";
+rm ./tmp.txt; rm ./tmp_.txt
+
+# Get local path to encrypted ipa
+ipa_path="./encrypted/$enc_filename"
+
+# If the ipa is not there, wtf?
+if [ ! -e "$ipa_path" ]; then
+	log_red "ERROR: ipa not found at $ipa_path."
+	exit 1
+fi
+
+# Get new filename for cracked ipa
+filename="${enc_filename// /_}" # replace spaces with underscore
+filename="${filename,,}" # make it all lowercase
+
+# Check if the app has been cracked already, if so use that instead.
+if [ -e "$CRACK_DIR$filename" ]; then
+	# App has been cracked already
+
+	# Get ipa size
+	size=$(du -m -s "$CRACK_DIR$filename" | cut -f 1)
+	log_green "App was cracked already! File is at $CRACK_DIR$filename [$size MB]"
+
+	# Delete encrypted ipa
+	rm "$ipa_path"
+
+else
+	# App has not been cracked yet
+	# Get app name and bundle id
+	unzip -q -d tmp "$ipa_path"
+	name=$(ls -d ./tmp/*/*.app | cut -f 4 -d '/' | sed "s:\\.app::")
+	bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" tmp/Payload/*/Info.plist)
+	rm -rf ./tmp/
+
+	# If the app is already installed - let's remove it first
+	log_yellow "Checking if the app ($bundle_id) is already installed..."
+	if ! output=`cfgutil remove-app "$bundle_id" 2>&1`; then
+		log_red "ERROR: $output"
+		exit 1
+	fi
+
+	# Install the app using 'cfgutil install-app <.ipa>'
+	log_yellow "Attempting to install ipa to connected device..."
+	if ! output=`cfgutil install-app "$ipa_path" 2>&1`; then
+		log_red "ERROR: $output"
+		exit 1
+	fi
+
+	log_green ".ipa was installed successfully!"
+
+	# Delete encrypted ipa
+	rm "$ipa_path"
+
+	sleep 1
+	log_yellow "SSHing to device..."
+	sleep 1
+	log_yellow "Cracking $name with rc336, please wait..."; echo -en "${GREEN}"
+
+	# Send crack command
+	ssh -o LogLevel=QUIET "root@$DEVICE_IP" <<-EOF
+	 	crack "$name"
+	EOF
+
+	# Transfer from remote to local using 'rsync'
+	log_yellow "Transferring file from device to $CRACK_DIR..."
+	mkdir -p $CRACK_DIR
+	if ! output=`rsync -qaz root@$DEVICE_IP:$DEVICE_DIR*.ipa $CRACK_DIR$filename 2>&1`; then
+		log_red "ERROR: $output"
+		exit 1
+	fi
+
+	# Check if file was actually transfered - you never know
+	if [ ! -e "$CRACK_DIR$filename" ]; then
+		log_red "ERROR: file not found at $CRACK_DIR$filename. Something went wrong."
+		exit 1
+	fi
+
+	# Get ipa size
+	size=$(du -m -s "$CRACK_DIR$filename" | cut -f 1)
+	log_green "Done! File is at $CRACK_DIR$filename [$size MB]"
+fi
+
+sleep 1
+
+# Upload to host via FTP using 'curl -T'
+log_yellow "Now uploading to $FTP_HOST..."; echo -en "${CYAN}"
+if ! curl -\# -T $CRACK_DIR$filename ftp://$FTP_USERNAME:$FTP_PASSWORD@$FTP_HOST$FTP_DIR; then
+	echo -en "${NC}"
+	log_red "ERROR: Failed to upload file."
+	exit 1
+fi
+
+log_green "Done! URL is ${CYAN}$BASEURL$filename"
+sleep 1
+
+# Prepare for appdb upload
+itunes=$itunes_url
+url="$BASEURL$filename"
+cracker=$CRACKERNAME
+
+log_yellow "Ok, uploading to appdb with the following parameters:"
+echo -e "${YELLOW}     [+] IPA URL:     ${CYAN}$url"
+echo -e "${YELLOW}     [+] iTunes URL:  ${CYAN}$itunes"
+echo -e "${YELLOW}     [+] Cracker:     ${CYAN}$cracker"
+sleep 0.5
+
+# Upload to appdb
+if ! curl -s -H 'Host: appdb.store' -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' -H 'Accept-Language: en-us' -H 'Content-Type: multipart/form-data; boundary=----WebKitFormBoundaryiAcQji35MbWzGZWg' -H 'Origin: http://appdb.store' -H 'User-Agent: '$USER_AGENT'' -H 'Upgrade-Insecure-Requests: 1' -H 'Referer: http://appdb.store/acp.php?action=upload&type=ios&url='$itunes'' -H 'Cookie: lt=YOUR_COOKIE; hash=YOUR_HASH; id=12; PHPSESSID=YOUR_PHPSESSID; lang=en' --data-binary '------WebKitFormBoundaryiAcQji35MbWzGZWg
+Content-Disposition: form-data; name="url"
+
+'$itunes'
+------WebKitFormBoundaryiAcQji35MbWzGZWg
+Content-Disposition: form-data; name="version"
+
+
+------WebKitFormBoundaryiAcQji35MbWzGZWg
+Content-Disposition: form-data; name="cracker"
+
+'$cracker'
+------WebKitFormBoundaryiAcQji35MbWzGZWg
+Content-Disposition: form-data; name="torrent"; filename=""
+Content-Type: application/octet-stream
+
+
+------WebKitFormBoundaryiAcQji35MbWzGZWg
+Content-Disposition: form-data; name="links[]"
+
+'$url'
+------WebKitFormBoundaryiAcQji35MbWzGZWg--
+' --compressed 'http://appdb.store/acp.php?action=upload&type=ios&url='$itunes'' > res; then
+
+	log_red "ERROR: curl request failed."
+	exit 1
+else
+	# Save response in a variable
+	html=$(cat res); rm res
+
+	elapsed_time="$(($SECONDS / 3600))h:$((($SECONDS / 60) % 60))m:$(($SECONDS % 60))s"
+
+	# Evaluate web response
+	if [[ "$html" == *'<input type="button" value="Upload More">'* ]]; then
+		log_green "Your content has been uploaded successfully to appdb! Script ended in [$elapsed_time]"
+    exit 0
+	elif [[ "$html" == *'<p class="heading">No Content with ID'* ]]; then
+		log_red "ERROR: No Content with such ID. Script ended in [$elapsed_time]"
+	elif [[ "$html" == *'Uploading is limited for new Free Content right now. Paid/Free'* ]]; then
+		log_red "ERROR: Uploading is limited for new free content."
+	elif [[ "$html" == *'We were unable to connect to iTunes/Mac App Store to determine latest version of content.'* ]]; then
+		log_red "ERROR: We were unable to connect to iTunes/Mac App Store to determine latest version of content."
+	else
+		log_red "ERROR: Unknown error occurred."
+	fi
+
+	exit 1
+
+fi
